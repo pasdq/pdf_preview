@@ -1,23 +1,22 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::broadcast;
-use tokio::time::{self, Duration};
+use tokio::sync::{broadcast, RwLock};
 use tokio::signal;
 use warp::filters::ws::Message;
 use warp::{http::Response, Filter};
 use futures_util::{StreamExt, SinkExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, error};
 use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::fmt::format::Writer;
 use std::fmt;
 use chrono::Local;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config, Result as NotifyResult};
 
 // 自定义时间格式，只显示时间
 struct TimeOnly;
 
 impl FormatTime for TimeOnly {
-    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+    fn format_time(&self, w: &mut dyn std::fmt::Write) -> fmt::Result {
         let now = Local::now();
         write!(w, "{}", now.format("%H:%M:%S"))
     }
@@ -53,55 +52,83 @@ async fn main() {
 
     // 提供当前最新的 PDF URL
     let content_route = {
-        let file_path = file_path.clone();
-        warp::path("content").map(move || {
-            let path = file_path.read().unwrap();
-            let response = match &*path {
-                Some(file_name) => warp::reply::json(&format!("/pdf/{}", file_name)),
-                None => warp::reply::json(&"No PDF file found".to_string()),
-            };
-            response
+        let file_path = Arc::clone(&file_path);
+        warp::path("content").and_then(move || {
+            let file_path = Arc::clone(&file_path);
+            async move {
+                let path = file_path.read().await;
+                let response = match &*path {
+                    Some(file_name) => warp::reply::json(&format!("/pdf/{}", file_name)),
+                    None => warp::reply::json(&"No PDF file found".to_string()),
+                };
+                Ok::<_, warp::Rejection>(response)
+            }
         })
     };
 
     // WebSocket 路由用于实时更新
     let ws_route = {
-        let tx = tx.clone();
+        let tx = Arc::clone(&tx);
         warp::path("ws")
             .and(warp::ws())
             .map(move |ws: warp::ws::Ws| {
-                let tx = tx.clone();
+                let tx = Arc::clone(&tx);
                 ws.on_upgrade(move |websocket| client_connection(websocket, tx.subscribe()))
             })
     };
 
     // 创建一个任务监控目录变化
-    let file_path_arc = file_path.clone();
-    let no_pdf_logged_arc = no_pdf_logged.clone();
-    let tx = tx.clone();
+    let file_path_arc = Arc::clone(&file_path);
+    let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
+    let tx = Arc::clone(&tx);
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
+        // 创建一个文件系统监视器
+        let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel(1);
+        let mut watcher = RecommendedWatcher::new(
+            move |res: NotifyResult<Event>| {
+                if let Ok(event) = res {
+                    let _ = watcher_tx.try_send(event);
+                }
+            },
+            Config::default(),
+        ).unwrap();
+
+        watcher.watch(Path::new("."), RecursiveMode::NonRecursive).unwrap();
+
+        while let Some(_event) = watcher_rx.recv().await {
             match find_first_pdf_in_dir(".").await {
-                Some(pdf_path) => {
+                Ok(Some(pdf_path)) => {
                     let pdf_file_name = pdf_path.file_name().unwrap().to_string_lossy().to_string();
-                    let mut path = file_path_arc.write().unwrap();
-                    let mut no_pdf_logged = no_pdf_logged_arc.write().unwrap();
-                    if *path != Some(pdf_file_name.clone()) {
-                        *path = Some(pdf_file_name.clone());
+                    let mut should_send = false;
+
+                    {
+                        let mut path = file_path_arc.write().await;
+                        if *path != Some(pdf_file_name.clone()) {
+                            *path = Some(pdf_file_name.clone());
+                            should_send = true;
+                        }
+                    }
+
+                    {
+                        let mut no_pdf_logged = no_pdf_logged_arc.write().await;
+                        *no_pdf_logged = false;
+                    }
+
+                    if should_send {
                         let pdf_url = format!("/pdf/{}", pdf_file_name);
                         let _ = tx.send(pdf_url);
                     }
-                    *no_pdf_logged = false;
                 }
-                None => {
-                    let mut no_pdf_logged = no_pdf_logged_arc.write().unwrap();
+                Ok(None) => {
+                    let mut no_pdf_logged = no_pdf_logged_arc.write().await;
                     if !*no_pdf_logged {
                         error!("No PDF file found in directory");
                         *no_pdf_logged = true;
                         let _ = tx.send("No PDF file found".to_string());
                     }
+                }
+                Err(err) => {
+                    error!("Error reading directory: {:?}", err);
                 }
             }
         }
@@ -129,14 +156,11 @@ async fn main() {
 }
 
 // 查找当前目录中第一个按名称排序的 PDF 文件
-async fn find_first_pdf_in_dir(dir: &str) -> Option<PathBuf> {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(_) => return None,
-    };
+async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
+    let mut entries = fs::read_dir(dir).await?;
 
     let mut pdf_files = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if let Some(ext) = path.extension() {
             if ext == "pdf" {
@@ -146,7 +170,7 @@ async fn find_first_pdf_in_dir(dir: &str) -> Option<PathBuf> {
     }
 
     pdf_files.sort();
-    pdf_files.first().cloned()
+    Ok(pdf_files.first().cloned())
 }
 
 // 处理 WebSocket 客户端连接
