@@ -1,0 +1,20 @@
+[package]
+name = "pdf_http_show"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3.18"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 'z'          # 优化级别为“z”，这是最高级别的优化
+lto = true               # 启用 Link-Time Optimization（LTO）
+codegen-units = 1        # 将编译单元设置为1以减少可执行文件大小
+panic = "abort"          # 不需要捕获 panic
