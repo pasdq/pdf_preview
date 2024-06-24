@@ -8,3 +8,5 @@ This Rust project is a simple server that monitors a directory for PDF files and
 - WebSocket Updates: Sends notifications to clients when a new PDF is available.
 - Static PDF Serving: Serves PDF files via a static route.
 - HTML Interface: Provides a simple HTML interface to display the latest PDF.
+
+http://0.0.0.0:8848
