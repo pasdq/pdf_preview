@@ -77,6 +77,29 @@ async fn main() {
             })
     };
 
+    // 在启动时检查当前目录中的PDF文件
+    {
+        let file_path_arc = Arc::clone(&file_path);
+        let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
+        let tx = Arc::clone(&tx);
+
+        if let Ok(Some(pdf_path)) = find_first_pdf_in_dir(".").await {
+            let pdf_file_name = pdf_path.file_name().unwrap().to_string_lossy().to_string();
+            {
+                let mut path = file_path_arc.write().await;
+                *path = Some(pdf_file_name.clone());
+            }
+
+            let pdf_url = format!("/pdf/{}", pdf_file_name);
+            let _ = tx.send(pdf_url);
+        } else {
+            let mut no_pdf_logged = no_pdf_logged_arc.write().await;
+            *no_pdf_logged = true;
+            error!("No PDF file found in directory");
+            let _ = tx.send("No PDF file found".to_string());
+        }
+    }
+
     // 创建一个任务监控目录变化
     let file_path_arc = Arc::clone(&file_path);
     let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
@@ -194,7 +217,7 @@ const INDEX_HTML: &str = r#"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF Viewer</title>
+    <title>PDF Preview</title>
 </head>
 <body>
     <div id="message"></div>
@@ -217,7 +240,7 @@ const INDEX_HTML: &str = r#"
         }
 
         function displayPDF(url) {
-            if (url === "No PDF file found") {
+            if (url === "No PDF file found!") {
                 messageDiv.textContent = url;
                 pdfFrame.style.display = "none";
             } else {
