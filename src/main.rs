@@ -11,8 +11,9 @@ use tracing_subscriber::fmt::time::FormatTime;
 use std::fmt;
 use chrono::Local;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config, Result as NotifyResult};
+use tokio::fs::metadata;
+use local_ip_address::local_ip;
 
-// 自定义时间格式，只显示时间
 struct TimeOnly;
 
 impl FormatTime for TimeOnly {
@@ -29,8 +30,12 @@ async fn main() {
         .with_timer(TimeOnly)
         .init();
 
+    // 获取本机局域网 IP 地址
+    let local_ip = local_ip().expect("Unable to get local IP address");
+    let server_address = format!("http://{}:8848", local_ip);
+
     // 提示服务器启动
-    info!("Starting server on http://0.0.0.0:8848");
+    info!("Starting server on {}", server_address);
 
     // 创建一个广播通道用于文件更新通知
     let (tx, _rx) = broadcast::channel::<String>(10);
@@ -178,7 +183,6 @@ async fn main() {
     info!("Server stopped.");
 }
 
-// 查找当前目录中第一个按名称排序的 PDF 文件
 async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
     let mut entries = fs::read_dir(dir).await?;
 
@@ -187,16 +191,17 @@ async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Er
         let path = entry.path();
         if let Some(ext) = path.extension() {
             if ext == "pdf" {
-                pdf_files.push(path);
+                let metadata = metadata(&path).await?;
+                pdf_files.push((path, metadata));
             }
         }
     }
 
-    pdf_files.sort();
-    Ok(pdf_files.first().cloned())
+    pdf_files.sort_by_key(|&(_, ref metadata)| metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH));
+    pdf_files.reverse();
+    Ok(pdf_files.first().map(|(path, _)| path.clone()))
 }
 
-// 处理 WebSocket 客户端连接
 async fn client_connection(
     ws: warp::filters::ws::WebSocket,
     mut rx: broadcast::Receiver<String>,
@@ -210,7 +215,6 @@ async fn client_connection(
     }
 }
 
-// 内嵌 HTML 内容
 const INDEX_HTML: &str = r#"
 <!DOCTYPE html>
 <html lang="en">
