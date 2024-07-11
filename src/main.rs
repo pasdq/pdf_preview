@@ -55,7 +55,7 @@ async fn main() {
     // 提供 PDF 文件的静态文件服务
     let pdf_route = warp::path("pdf").and(warp::fs::dir("."));
 
-    // 提供当前最新的 PDF URL
+    // 提供当前最新的 PDF 文件名
     let content_route = {
         let file_path = Arc::clone(&file_path);
         warp::path("content").and_then(move || {
@@ -63,7 +63,10 @@ async fn main() {
             async move {
                 let path = file_path.read().await;
                 let response = match &*path {
-                    Some(file_name) => warp::reply::json(&format!("/pdf/{}", file_name)),
+                    Some(file_name) => {
+                        let file_stem = Path::new(file_name).file_stem().unwrap().to_string_lossy().to_string();
+                        warp::reply::json(&file_stem)
+                    }
                     None => warp::reply::json(&"No PDF file found".to_string()),
                 };
                 Ok::<_, warp::Rejection>(response)
@@ -95,8 +98,8 @@ async fn main() {
                 *path = Some(pdf_file_name.clone());
             }
 
-            let pdf_url = format!("/pdf/{}", pdf_file_name);
-            let _ = tx.send(pdf_url);
+            let pdf_file_stem = Path::new(&pdf_file_name).file_stem().unwrap().to_string_lossy().to_string();
+            let _ = tx.send(pdf_file_stem);
         } else {
             let mut no_pdf_logged = no_pdf_logged_arc.write().await;
             *no_pdf_logged = true;
@@ -143,8 +146,8 @@ async fn main() {
                     }
 
                     if should_send {
-                        let pdf_url = format!("/pdf/{}", pdf_file_name);
-                        let _ = tx.send(pdf_url);
+                        let pdf_file_stem = Path::new(&pdf_file_name).file_stem().unwrap().to_string_lossy().to_string();
+                        let _ = tx.send(pdf_file_stem);
                     }
                 }
                 Ok(None) => {
@@ -221,7 +224,7 @@ const INDEX_HTML: &str = r#"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF Preview</title>
+    <title id="title">PDF Preview</title>
 </head>
 <body>
     <div id="message"></div>
@@ -229,6 +232,7 @@ const INDEX_HTML: &str = r#"
     <script>
         const pdfFrame = document.getElementById("pdf-frame");
         const messageDiv = document.getElementById("message");
+        const titleElement = document.getElementById("title");
 
         async function fetchFileContent() {
             const response = await fetch('/content');
@@ -243,14 +247,16 @@ const INDEX_HTML: &str = r#"
             };
         }
 
-        function displayPDF(url) {
-            if (url === "No PDF file found!") {
-                messageDiv.textContent = url;
+        function displayPDF(fileName) {
+            if (fileName === "No PDF file found") {
+                messageDiv.textContent = fileName;
                 pdfFrame.style.display = "none";
+                titleElement.textContent = "PDF Preview";
             } else {
                 messageDiv.textContent = "";
                 pdfFrame.style.display = "block";
-                pdfFrame.src = url;
+                pdfFrame.src = `/pdf/${fileName}.pdf`;
+                titleElement.textContent = fileName;
             }
         }
 
