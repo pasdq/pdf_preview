@@ -256,7 +256,7 @@ const INDEX_HTML: &str = r#"
                 messageDiv.textContent = "";
                 pdfFrame.style.display = "block";
                 pdfFrame.src = `/pdf/${fileName}.pdf`;
-                titleElement.textContent = fileName;
+                titleElement.textContent = fileName + " | pdf_http_show V1.0";
             }
         }
 
