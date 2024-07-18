@@ -44,6 +44,7 @@ async fn main() {
     // 共享的文件路径和状态
     let file_path = Arc::new(RwLock::new(None));
     let no_pdf_logged = Arc::new(RwLock::new(false));
+    let updating_file = Arc::new(RwLock::new(false));
 
     // 提供 HTML 页面
     let html_route = warp::path::end().map(|| {
@@ -111,6 +112,7 @@ async fn main() {
     // 创建一个任务监控目录变化
     let file_path_arc = Arc::clone(&file_path);
     let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
+    let updating_file_arc = Arc::clone(&updating_file);
     let tx = Arc::clone(&tx);
     tokio::spawn(async move {
         // 创建一个文件系统监视器
@@ -127,6 +129,12 @@ async fn main() {
         watcher.watch(Path::new("."), RecursiveMode::NonRecursive).unwrap();
 
         while let Some(_event) = watcher_rx.recv().await {
+            // 标记文件正在更新
+            {
+                let mut updating = updating_file_arc.write().await;
+                *updating = true;
+            }
+
             match find_first_pdf_in_dir(".").await {
                 Ok(Some(pdf_path)) => {
                     let pdf_file_name = pdf_path.file_name().unwrap().to_string_lossy().to_string();
@@ -151,16 +159,24 @@ async fn main() {
                     }
                 }
                 Ok(None) => {
-                    let mut no_pdf_logged = no_pdf_logged_arc.write().await;
-                    if !*no_pdf_logged {
-                        error!("No PDF file found in directory");
-                        *no_pdf_logged = true;
-                        let _ = tx.send("No PDF file found".to_string());
+                    {
+                        let mut no_pdf_logged = no_pdf_logged_arc.write().await;
+                        if !*no_pdf_logged {
+                            error!("No PDF file found in directory");
+                            *no_pdf_logged = true;
+                            // 不立即发送“没有 PDF 文件”的通知
+                        }
                     }
                 }
                 Err(err) => {
                     error!("Error reading directory: {:?}", err);
                 }
+            }
+
+            // 取消文件更新标记
+            {
+                let mut updating = updating_file_arc.write().await;
+                *updating = false;
             }
         }
     });
@@ -224,42 +240,58 @@ const INDEX_HTML: &str = r#"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title id="title">PDF Preview</title>
+    <title>PDF Viewer</title>
+    <style>
+        body, html {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+    </style>
 </head>
 <body>
-    <div id="message"></div>
-    <iframe id="pdf-frame" style="width: 100%; height: 100vh;" frameborder="0"></iframe>
+    <iframe id="pdf-frame" src=""></iframe>
     <script>
         const pdfFrame = document.getElementById("pdf-frame");
-        const messageDiv = document.getElementById("message");
-        const titleElement = document.getElementById("title");
 
         async function fetchFileContent() {
             const response = await fetch('/content');
-            const data = await response.json();
-            displayPDF(data);
-        }
-
-        function setupWebSocket() {
-            const ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onmessage = (event) => {
-                displayPDF(event.data);
-            };
-        }
-
-        function displayPDF(fileName) {
-            if (fileName === "No PDF file found") {
-                messageDiv.textContent = fileName;
-                pdfFrame.style.display = "none";
-                titleElement.textContent = "PDF Preview";
-            } else {
-                messageDiv.textContent = "";
-                pdfFrame.style.display = "block";
-                pdfFrame.src = `/pdf/${fileName}.pdf`;
-                titleElement.textContent = fileName + " | pdf_http_show V1.0";
+            const fileName = await response.json();
+            if (fileName !== 'No PDF file found') {
+                const browserType = getBrowserType();
+                const zoomParam = browserType === 'Firefox' ? '#zoom=page-width' : '#view=FitH';
+                pdfFrame.src = '/pdf/' + fileName + '.pdf' + zoomParam;
             }
         }
 
+        function setupWebSocket() {
+            const ws = new WebSocket('ws://' + window.location.host + '/ws');
+            ws.onmessage = (event) => {
+                const fileName = event.data;
+                if (fileName !== 'No PDF file found') {
+                    const browserType = getBrowserType();
+                    const zoomParam = browserType === 'Firefox' ? '#zoom=page-width' : '#view=FitH';
+                    pdfFrame.src = '/pdf/' + fileName + '.pdf' + zoomParam;
+                }
+            };
+        }
+
+        function getBrowserType() {
+            const userAgent = navigator.userAgent;
+            if (userAgent.indexOf('Firefox') > -1) {
+                return 'Firefox';
+            } else if (userAgent.indexOf('Chrome') > -1 || userAgent.indexOf('Edg') > -1) {
+                return 'Chrome';
+            }
+            return 'Other';
+        }
+		
         fetchFileContent();
         setupWebSocket();
     </script>
