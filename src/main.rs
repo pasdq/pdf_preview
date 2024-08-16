@@ -120,6 +120,12 @@ async fn main() {
         let mut watcher = RecommendedWatcher::new(
             move |res: NotifyResult<Event>| {
                 if let Ok(event) = res {
+                    // 检查事件是否来自 `temporary` 文件夹或该文件夹内的文件，如果是则忽略
+                    if event.paths.iter().any(|path| {
+                        path.starts_with("temporary") || path.components().any(|c| c.as_os_str() == "temporary")
+                    }) {
+                        return; // 忽略来自 `temporary` 文件夹的事件
+                    }
                     let _ = watcher_tx.try_send(event);
                 }
             },
@@ -204,12 +210,16 @@ async fn main() {
 
 async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
     // 循环十次
-    for _ in 0..10 {
+    for i in 1..=9 {
+        info!("This is the {} attempt to locate the PDF files!", i);  // 输出 "......(i)"，i 表示当前循环次数
         let mut entries = fs::read_dir(dir).await?;
-
         let mut pdf_files = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
+            // 忽略 `temporary` 文件夹中的文件
+            if path.starts_with("temporary") || path.components().any(|c| c.as_os_str() == "temporary") {
+                continue;
+            }
             if let Some(ext) = path.extension() {
                 if ext == "pdf" {
                     let metadata = metadata(&path).await?;
@@ -302,7 +312,7 @@ const INDEX_HTML: &str = r#"
             }
             return 'Other';
         }
-		
+
         fetchFileContent();
         setupWebSocket();
     </script>
