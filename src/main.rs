@@ -203,8 +203,8 @@ async fn main() {
 }
 
 async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
-    // 循环六次
-    for _ in 0..6 {
+    // 循环十次
+    for _ in 0..10 {
         let mut entries = fs::read_dir(dir).await?;
 
         let mut pdf_files = Vec::new();
@@ -225,8 +225,8 @@ async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Er
             return Ok(Some(pdf_files.first().map(|(path, _)| path.clone()).unwrap()));
         }
 
-        // 等待 50 毫秒再进行下一次检查
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 等待 100 毫秒再进行下一次检查
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     Ok(None)
