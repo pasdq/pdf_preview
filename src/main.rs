@@ -104,7 +104,7 @@ async fn main() {
         } else {
             let mut no_pdf_logged = no_pdf_logged_arc.write().await;
             *no_pdf_logged = true;
-            error!("No PDF file found in directory");
+            error!("No PDF file found in directory!");
             let _ = tx.send("No PDF file found".to_string());
         }
     }
@@ -162,7 +162,7 @@ async fn main() {
                     {
                         let mut no_pdf_logged = no_pdf_logged_arc.write().await;
                         if !*no_pdf_logged {
-                            error!("No PDF file found in directory");
+                            error!("No PDF file found in directory!");
                             *no_pdf_logged = true;
                             // 不立即发送“没有 PDF 文件”的通知
                         }
@@ -203,22 +203,33 @@ async fn main() {
 }
 
 async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
-    let mut entries = fs::read_dir(dir).await?;
+    // 循环六次
+    for _ in 0..6 {
+        let mut entries = fs::read_dir(dir).await?;
 
-    let mut pdf_files = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "pdf" {
-                let metadata = metadata(&path).await?;
-                pdf_files.push((path, metadata));
+        let mut pdf_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext == "pdf" {
+                    let metadata = metadata(&path).await?;
+                    pdf_files.push((path, metadata));
+                }
             }
         }
+
+        pdf_files.sort_by_key(|&(_, ref metadata)| metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH));
+        pdf_files.reverse();
+
+        if !pdf_files.is_empty() {
+            return Ok(Some(pdf_files.first().map(|(path, _)| path.clone()).unwrap()));
+        }
+
+        // 等待 50 毫秒再进行下一次检查
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    pdf_files.sort_by_key(|&(_, ref metadata)| metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH));
-    pdf_files.reverse();
-    Ok(pdf_files.first().map(|(path, _)| path.clone()))
+    Ok(None)
 }
 
 async fn client_connection(
