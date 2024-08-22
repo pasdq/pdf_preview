@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, mpsc};
 use tokio::signal;
 use warp::filters::ws::Message;
 use warp::{http::Response, Filter};
@@ -14,58 +14,68 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config, Result a
 use tokio::fs::metadata;
 use local_ip_address::local_ip;
 
+// 定义一个仅显示时间的结构体，用于日志记录
 struct TimeOnly;
 
 impl FormatTime for TimeOnly {
+    // 实现格式化时间的方法
     fn format_time(&self, w: &mut dyn std::fmt::Write) -> fmt::Result {
         let now = Local::now();
         write!(w, "{}", now.format("%H:%M:%S"))
     }
 }
 
+// 共享状态结构体，包含文件路径和更新状态等信息
+struct SharedState {
+    file_path: Option<String>,
+    no_pdf_logged: bool,
+    updating_file: bool,
+}
+
 #[tokio::main]
 async fn main() {
-    // 设置日志系统，只显示时间
+    // 初始化日志记录器
     tracing_subscriber::fmt()
         .with_timer(TimeOnly)
         .init();
 
-    // 获取本机局域网 IP 地址
+    // 获取本地IP地址并构建服务器地址
     let local_ip = local_ip().expect("Unable to get local IP address");
     let server_address = format!("http://{}:8848", local_ip);
 
-    // 提示服务器启动
     info!("Starting server on {}", server_address);
 
-    // 创建一个广播通道用于文件更新通知
+    // 创建广播通道，用于在多个任务之间传递消息
     let (tx, _rx) = broadcast::channel::<String>(10);
     let tx = Arc::new(tx);
 
-    // 共享的文件路径和状态
-    let file_path = Arc::new(RwLock::new(None));
-    let no_pdf_logged = Arc::new(RwLock::new(false));
-    let updating_file = Arc::new(RwLock::new(false));
+    // 初始化共享状态
+    let shared_state = Arc::new(RwLock::new(SharedState {
+        file_path: None,
+        no_pdf_logged: false,
+        updating_file: false,
+    }));
 
-    // 提供 HTML 页面
+    // 设置HTML路由，返回静态HTML内容
     let html_route = warp::path::end().map(|| {
         Response::builder()
             .header("content-type", "text/html")
             .body(INDEX_HTML)
     });
 
-    // 提供 PDF 文件的静态文件服务
+    // 设置PDF路由，返回当前目录下的PDF文件
     let pdf_route = warp::path("pdf").and(warp::fs::dir("."));
 
-    // 提供当前最新的 PDF 文件名
+    // 设置内容路由，返回当前加载的PDF文件名
     let content_route = {
-        let file_path = Arc::clone(&file_path);
+        let shared_state = Arc::clone(&shared_state);
         warp::path("content").and_then(move || {
-            let file_path = Arc::clone(&file_path);
+            let shared_state = Arc::clone(&shared_state);
             async move {
-                let path = file_path.read().await;
-                let response = match &*path {
+                let path = shared_state.read().await.file_path.clone();
+                let response = match path {
                     Some(file_name) => {
-                        let file_stem = Path::new(file_name).file_stem().unwrap().to_string_lossy().to_string();
+                        let file_stem = Path::new(&file_name).file_stem().unwrap().to_string_lossy().to_string();
                         warp::reply::json(&file_stem)
                     }
                     None => warp::reply::json(&"No PDF file found".to_string()),
@@ -75,7 +85,7 @@ async fn main() {
         })
     };
 
-    // WebSocket 路由用于实时更新
+    // 设置WebSocket路由，用于实时推送PDF文件更新
     let ws_route = {
         let tx = Arc::clone(&tx);
         warp::path("ws")
@@ -86,59 +96,61 @@ async fn main() {
             })
     };
 
-    // 在启动时检查当前目录中的PDF文件
+    // 查找目录中的第一个PDF文件，并更新共享状态和广播通道
     {
-        let file_path_arc = Arc::clone(&file_path);
-        let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
+        let shared_state = Arc::clone(&shared_state);
         let tx = Arc::clone(&tx);
 
         if let Ok(Some(pdf_path)) = find_first_pdf_in_dir(".").await {
             let pdf_file_name = pdf_path.file_name().unwrap().to_string_lossy().to_string();
             {
-                let mut path = file_path_arc.write().await;
-                *path = Some(pdf_file_name.clone());
+                let mut state = shared_state.write().await;
+                state.file_path = Some(pdf_file_name.clone());
+                state.no_pdf_logged = false;
             }
-
             let pdf_file_stem = Path::new(&pdf_file_name).file_stem().unwrap().to_string_lossy().to_string();
             let _ = tx.send(pdf_file_stem);
         } else {
-            let mut no_pdf_logged = no_pdf_logged_arc.write().await;
-            *no_pdf_logged = true;
+            let mut state = shared_state.write().await;
+            state.no_pdf_logged = true;
             error!("No PDF file found in directory!");
             let _ = tx.send("No PDF file found".to_string());
         }
     }
 
-    // 创建一个任务监控目录变化
-    let file_path_arc = Arc::clone(&file_path);
-    let no_pdf_logged_arc = Arc::clone(&no_pdf_logged);
-    let updating_file_arc = Arc::clone(&updating_file);
+    // 设置文件监视器，用于监听目录中的PDF文件变化
+    let (watcher_tx, mut watcher_rx) = mpsc::channel(1);
+    let shared_state = Arc::clone(&shared_state);
     let tx = Arc::clone(&tx);
     tokio::spawn(async move {
-        // 创建一个文件系统监视器
-        let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel(1);
         let mut watcher = RecommendedWatcher::new(
             move |res: NotifyResult<Event>| {
                 if let Ok(event) = res {
-                    // 检查事件是否来自 `temporary` 文件夹或该文件夹内的文件，如果是则忽略
-                    if event.paths.iter().any(|path| {
-                        path.starts_with("temporary") || path.components().any(|c| c.as_os_str() == "temporary")
-                    }) {
-                        return; // 忽略来自 `temporary` 文件夹的事件
+                    if event.paths.iter().any(|path| path.extension() == Some(std::ffi::OsStr::new("pdf"))) {
+                        let _ = watcher_tx.try_send(event);
                     }
-                    let _ = watcher_tx.try_send(event);
                 }
             },
             Config::default(),
-        ).unwrap();
+        )
+        .unwrap();
 
         watcher.watch(Path::new("."), RecursiveMode::NonRecursive).unwrap();
 
-        while let Some(_event) = watcher_rx.recv().await {
-            // 标记文件正在更新
-            {
-                let mut updating = updating_file_arc.write().await;
-                *updating = true;
+        let mut last_event_time = tokio::time::Instant::now();
+        let debounce_duration = tokio::time::Duration::from_millis(100);
+
+        while let Some(event) = watcher_rx.recv().await {
+            let now = tokio::time::Instant::now();
+            if now - last_event_time < debounce_duration {
+                continue;
+            }
+
+            last_event_time = now;
+
+            if event.kind.is_remove() {
+                let mut state = shared_state.write().await;
+                state.file_path = None;
             }
 
             match find_first_pdf_in_dir(".").await {
@@ -147,16 +159,12 @@ async fn main() {
                     let mut should_send = false;
 
                     {
-                        let mut path = file_path_arc.write().await;
-                        if *path != Some(pdf_file_name.clone()) {
-                            *path = Some(pdf_file_name.clone());
+                        let mut state = shared_state.write().await;
+                        if state.file_path != Some(pdf_file_name.clone()) {
+                            state.file_path = Some(pdf_file_name.clone());
                             should_send = true;
                         }
-                    }
-
-                    {
-                        let mut no_pdf_logged = no_pdf_logged_arc.write().await;
-                        *no_pdf_logged = false;
+                        state.no_pdf_logged = false;
                     }
 
                     if should_send {
@@ -165,41 +173,35 @@ async fn main() {
                     }
                 }
                 Ok(None) => {
-                    {
-                        let mut no_pdf_logged = no_pdf_logged_arc.write().await;
-                        if !*no_pdf_logged {
-                            error!("No PDF file found in directory!");
-                            *no_pdf_logged = true;
-                            // 不立即发送“没有 PDF 文件”的通知
-                        }
+                    let mut state = shared_state.write().await;
+                    if !state.no_pdf_logged {
+                        error!("No PDF file found in directory!");
+                        state.no_pdf_logged = true;
+                        let _ = tx.send("No PDF file found".to_string());
                     }
+                    state.file_path = None;
                 }
                 Err(err) => {
                     error!("Error reading directory: {:?}", err);
                 }
             }
 
-            // 取消文件更新标记
-            {
-                let mut updating = updating_file_arc.write().await;
-                *updating = false;
-            }
+            shared_state.write().await.updating_file = false;
         }
     });
 
-    // 组合路由
+    // 合并所有路由
     let routes = html_route.or(pdf_route).or(content_route).or(ws_route);
 
-    // 服务器绑定和运行
+    // 启动Warp服务器并绑定到指定地址和端口
     let server = warp::serve(routes).bind(([0, 0, 0, 0], 8848));
 
-    // 捕获 Ctrl+C 退出信号
+    // 设置优雅关机
     let graceful = async {
         signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
         info!("Shutting down server gracefully...");
     };
 
-    // 运行服务器和监听退出信号
     tokio::select! {
         _ = server => {},
         _ = graceful => {},
@@ -208,40 +210,36 @@ async fn main() {
     info!("Server stopped.");
 }
 
+// 查找指定目录中的第一个PDF文件
 async fn find_first_pdf_in_dir(dir: &str) -> Result<Option<PathBuf>, std::io::Error> {
-    // 循环十次
     for i in 1..=9 {
-        info!("This is the {} attempt to locate the PDF files!", i);  // 输出 "......(i)"，i 表示当前循环次数
+        info!("This is the {} attempt to locate the PDF files!", i);
         let mut entries = fs::read_dir(dir).await?;
-        let mut pdf_files = Vec::new();
+        let mut latest_pdf: Option<(PathBuf, std::time::SystemTime)> = None;
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            // 忽略 `temporary` 文件夹中的文件
-            if path.starts_with("temporary") || path.components().any(|c| c.as_os_str() == "temporary") {
-                continue;
-            }
-            if let Some(ext) = path.extension() {
-                if ext == "pdf" {
-                    let metadata = metadata(&path).await?;
-                    pdf_files.push((path, metadata));
+            if path.extension() == Some(std::ffi::OsStr::new("pdf")) {
+                let metadata = metadata(&path).await?;
+                let modified_time = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+                if latest_pdf.is_none() || modified_time > latest_pdf.as_ref().unwrap().1 {
+                    latest_pdf = Some((path.clone(), modified_time));
                 }
             }
         }
 
-        pdf_files.sort_by_key(|&(_, ref metadata)| metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH));
-        pdf_files.reverse();
-
-        if !pdf_files.is_empty() {
-            return Ok(Some(pdf_files.first().map(|(path, _)| path.clone()).unwrap()));
+        if let Some((pdf_path, _)) = latest_pdf {
+            return Ok(Some(pdf_path));
         }
 
-        // 等待 100 毫秒再进行下一次检查
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     Ok(None)
 }
 
+// 处理客户端WebSocket连接
 async fn client_connection(
     ws: warp::filters::ws::WebSocket,
     mut rx: broadcast::Receiver<String>,
@@ -249,12 +247,12 @@ async fn client_connection(
     let (mut tx, _) = ws.split();
     while let Ok(new_content) = rx.recv().await {
         if tx.send(Message::text(new_content)).await.is_err() {
-            // WebSocket 连接可能已断开
             break;
         }
     }
 }
 
+// 静态 HTML 页面
 const INDEX_HTML: &str = r#"
 <!DOCTYPE html>
 <html lang="en">
@@ -319,3 +317,4 @@ const INDEX_HTML: &str = r#"
 </body>
 </html>
 "#;
+
